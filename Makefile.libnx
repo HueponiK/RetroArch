@@ -160,7 +160,7 @@ endif
 ifeq ($(HAVE_DEKO3D), 1)
   CFLAGS  += -DHAVE_DEKO3D
   CXXFLAGS += -DHAVE_DEKO3D
-  LIBS := -ldeko3d $(LIBS)
+  LIBS := -ldeko3d -luam $(LIBS)
 endif
 
 #---------------------------------------------------------------------------------
