@@ -2075,6 +2075,17 @@ static void dk3d_render_pass(dk3d_filter_chain_t *chain, DkCmdBuf cmd,
             continue;
 
          dk3d_make_view(&view, tex_img);
+
+         /* Force the original game frame to read back opaque alpha. The
+          * software and Vulkan paths present an opaque frame; the deko3d
+          * HW-direct path exposes the raw PSX framebuffer, whose alpha is the
+          * STP/mask bit (~0), which breaks shaders that read Source.a (e.g.
+          * crt-guest's "1.0 / LinearizePass.a"). Apply only to the original
+          * frame — never the intermediate pass FBOs, which carry real alpha. */
+         if (tb->type == DK3D_TEX_ORIGINAL
+               || (tb->type == DK3D_TEX_SOURCE && pass_idx == 0))
+            view.swizzle[3] = DkImageSwizzle_One;
+
          dkImageDescriptorInitialize(&img_descs[chain->num_images],
                &view, false, false);
          tex_handles[num_bound] = dkMakeTextureHandle(chain->num_images, sampler_idx);
