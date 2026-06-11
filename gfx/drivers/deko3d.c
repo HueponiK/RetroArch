@@ -38,6 +38,8 @@
 #include "../../configuration.h"
 #include <features/features_cpu.h>
 
+#include "../drivers_shader/shader_deko3d.h"
+
 /* ====================================================================== *
  *  Helpers: image and staging creation
  * ====================================================================== */
@@ -59,9 +61,9 @@ static uint32_t dk3d_align_up(uint32_t v, uint32_t a)
    return (v + (a - 1)) & ~(a - 1);
 }
 
-bool dk3d_create_image_2d(DkDevice device,
+bool dk3d_create_image_2d_mips(DkDevice device,
       uint32_t width, uint32_t height, DkImageFormat fmt,
-      uint32_t flags, dk3d_image_t *out)
+      uint32_t flags, uint32_t mip_levels, dk3d_image_t *out)
 {
    DkImageLayoutMaker lm;
    DkImageLayout      layout;
@@ -78,6 +80,7 @@ bool dk3d_create_image_2d(DkDevice device,
    lm.dimensions[0] = width;
    lm.dimensions[1] = height;
    lm.dimensions[2] = 0;
+   lm.mipLevels     = mip_levels ? mip_levels : 1;
    dkImageLayoutInitialize(&layout, &lm);
 
    size  = dkImageLayoutGetSize(&layout);
@@ -96,10 +99,18 @@ bool dk3d_create_image_2d(DkDevice device,
       return false;
 
    dkImageInitialize(&out->image, &layout, out->memblock, 0);
-   out->width  = width;
-   out->height = height;
-   out->format = fmt;
+   out->width      = width;
+   out->height     = height;
+   out->format     = fmt;
+   out->mip_levels = lm.mipLevels;
    return true;
+}
+
+bool dk3d_create_image_2d(DkDevice device,
+      uint32_t width, uint32_t height, DkImageFormat fmt,
+      uint32_t flags, dk3d_image_t *out)
+{
+   return dk3d_create_image_2d_mips(device, width, height, fmt, flags, 1, out);
 }
 
 void dk3d_destroy_image(dk3d_image_t *img)
@@ -762,6 +773,13 @@ static bool dk3d_ctx_get_metrics(void *data,
    return true;
 }
 
+static uint32_t dk3d_ctx_get_flags(void *data)
+{
+   uint32_t flags = 0;
+   BIT32_SET(flags, GFX_CTX_FLAGS_SHADERS_SLANG);
+   return flags;
+}
+
 static gfx_ctx_driver_t dk3d_gfx_ctx;
 
 static void *dk3d_init(const video_info_t *video,
@@ -903,6 +921,7 @@ static void *dk3d_init(const video_info_t *video,
    /* Register the gfx_ctx so RA's display layer can query our DPI
     * for ozone/xmb scale calculation. */
    dk3d_gfx_ctx.get_metrics = dk3d_ctx_get_metrics;
+   dk3d_gfx_ctx.get_flags   = dk3d_ctx_get_flags;
    video_context_driver_set(&dk3d_gfx_ctx);
 
    /* Tell RA that texture_image loaders should hand us RGBA-byte-order
@@ -945,10 +964,16 @@ static void dk3d_free(void *data)
 
    font_driver_free_osd();
 
+   if (dk3d->filter_chain)
+   {
+      dk3d_filter_chain_free(dk3d->filter_chain);
+      dk3d->filter_chain = NULL;
+   }
    dk3d_menu_pipeline_free(dk3d);
    dk3d_blit_pipeline_free(dk3d);
    dk3d_stage_destroy(&dk3d->menu_stage);
    dk3d_stage_destroy(&dk3d->sw_stage);
+   dk3d_destroy_image(&dk3d->chain_input);
    dk3d_destroy_frames(dk3d);
    if (dk3d->swapchain) { dkSwapchainDestroy(dk3d->swapchain); dk3d->swapchain = NULL; }
    for (i = 0; i < dk3d->num_swapchain_images; i++)
@@ -1036,6 +1061,10 @@ static void dk3d_check_resize(dk3d_t *dk3d)
    dk3d->vp.height      = new_h;
    dk3d->should_resize  = true;
    dk3d->applet_op_mode = op_mode;
+
+   if (dk3d->filter_chain)
+      dk3d_filter_chain_update_swapchain(dk3d->filter_chain,
+            new_w, new_h, DkImageFormat_RGBA8_Unorm);
 }
 
 /* ====================================================================== *
@@ -1197,6 +1226,135 @@ static void dk3d_blit(dk3d_t *dk3d, dk3d_frame_t *f,
 static uint32_t dk3d_menu_bump(uint32_t *off, uint32_t cap,
       uint32_t size, uint32_t align);
 
+/* Composite a 3D-rendered source image onto the currently-acquired swapchain
+ * via the 3D blit pipeline (blit_vsh/blit_fsh), a textured full-screen quad.
+ *
+ * Unlike dk3d_blit (2D engine), this BINDS THE SWAPCHAIN as the 3D render
+ * target, so subsequent menu/OSD/font draws — which bind no render target of
+ * their own — composite onto the swapchain instead of whatever FBO the filter
+ * chain last bound. This is the whole point of presenting via 3D: it keeps one
+ * Y-origin convention across content + UI (the long-standing 2D/3D mismatch).
+ *
+ * dst_rect positions the quad inside the swapchain (the surrounding letterbox
+ * comes from the swapchain's black clear). flip=false yields an upright image
+ * (uv.y inverted vs clip.y, cancelling the scanout flip — same convention as
+ * the filter chain's old final-pass-to-swapchain quad). flip=true samples the
+ * source bottom-up for an already-bottom-left source. */
+static void dk3d_present_3d(dk3d_t *dk3d, dk3d_frame_t *f,
+      const DkImage *src, const DkImageRect *dst_rect, bool flip)
+{
+   DkCmdBuf            cmd = f->cmdbuf;
+   const DkImage      *swap_img;
+   DkImageView         sc_view;
+   DkImageView         src_view;
+   DkImageDescriptor  *img_heap;
+   DkResHandle         handle;
+   uint32_t            tex_idx;
+   uint32_t            voff;
+   float              *vbo;
+   const uint32_t      vstride = 4 * sizeof(float); /* vec2 pos + vec2 uv */
+   const uint32_t      vsize   = 4 * vstride;       /* 4-vert triangle strip */
+   float               uv_bot, uv_top;
+   const DkShader     *shaders[2];
+   DkVtxAttribState    attribs[2];
+   DkVtxBufferState    vbuf_state;
+   DkRasterizerState   rs;
+   DkDepthStencilState ds;
+   DkColorState        cs;
+   DkColorWriteState   cws;
+   DkBlendState        bs;
+   DkViewport          vp;
+   DkScissor           sc;
+
+   if (dk3d->acquired_slot < 0 || !src || !dst_rect)
+      return;
+   if (f->menu_img_desc_next >= DK3D_MENU_IMAGE_DESCS)
+      return;
+
+   swap_img = &dk3d->sc_images[dk3d->acquired_slot].image;
+
+   /* Rebind the swapchain as the 3D render target (the filter chain left its
+    * own final FBO bound). */
+   dk3d_make_image_view(&sc_view, swap_img);
+   {
+      const DkImageView *targets[1] = { &sc_view };
+      dkCmdBufBindRenderTargets(cmd, targets, 1, NULL);
+   }
+
+   /* Bump a 4-vertex quad into the per-frame VBO ring.
+    * flip=false: clip top (+1) samples uv.y=0 (source top row) -> upright. */
+   voff = dk3d_menu_bump(&f->menu_vbo_off, f->menu_vbo_cap, vsize, 16);
+   if (voff == UINT32_MAX)
+      return;
+   vbo    = (float*)((uint8_t*)f->menu_vbo_ptr + voff);
+   uv_bot = flip ? 0.0f : 1.0f;
+   uv_top = flip ? 1.0f : 0.0f;
+   /* BL */ vbo[ 0] = -1.0f; vbo[ 1] = -1.0f; vbo[ 2] = 0.0f; vbo[ 3] = uv_bot;
+   /* BR */ vbo[ 4] =  1.0f; vbo[ 5] = -1.0f; vbo[ 6] = 1.0f; vbo[ 7] = uv_bot;
+   /* TL */ vbo[ 8] = -1.0f; vbo[ 9] =  1.0f; vbo[10] = 0.0f; vbo[11] = uv_top;
+   /* TR */ vbo[12] =  1.0f; vbo[13] =  1.0f; vbo[14] = 1.0f; vbo[15] = uv_top;
+
+   /* Per-frame image descriptor for the source, sampler 0 in the blit heap. */
+   img_heap = (DkImageDescriptor*)f->menu_img_desc_ptr;
+   dk3d_make_image_view(&src_view, src);
+   dkImageDescriptorInitialize(&img_heap[f->menu_img_desc_next], &src_view,
+         false, false);
+   tex_idx = f->menu_img_desc_next++;
+   handle  = dkMakeTextureHandle(tex_idx, 0);
+
+   shaders[0] = &dk3d->blit_vsh;
+   shaders[1] = &dk3d->blit_fsh;
+   dkCmdBufBindShaders(cmd, DkStageFlag_GraphicsMask, shaders, 2);
+
+   memset(attribs, 0, sizeof(attribs));
+   attribs[0].bufferId = 0; attribs[0].offset = 0;
+   attribs[0].size = DkVtxAttribSize_2x32; attribs[0].type = DkVtxAttribType_Float;
+   attribs[1].bufferId = 0; attribs[1].offset = 8;
+   attribs[1].size = DkVtxAttribSize_2x32; attribs[1].type = DkVtxAttribType_Float;
+   dkCmdBufBindVtxAttribState(cmd, attribs, 2);
+
+   vbuf_state.stride  = vstride;
+   vbuf_state.divisor = 0;
+   dkCmdBufBindVtxBufferState(cmd, &vbuf_state, 1);
+   dkCmdBufBindVtxBuffer(cmd, 0, f->menu_vbo_gpu + voff, vsize);
+
+   dkCmdBufBindImageDescriptorSet(cmd, f->menu_img_desc_gpu, DK3D_MENU_IMAGE_DESCS);
+   dkCmdBufBindSamplerDescriptorSet(cmd, dk3d->blit_sampler_desc_gpu, 1);
+   dkCmdBufBindTextures(cmd, DkStage_Fragment, 0, &handle, 1);
+
+   dkRasterizerStateDefaults(&rs);
+   rs.cullMode = DkFace_None;
+   dkCmdBufBindRasterizerState(cmd, &rs);
+
+   dkDepthStencilStateDefaults(&ds);
+   ds.depthTestEnable  = false;
+   ds.depthWriteEnable = false;
+   dkCmdBufBindDepthStencilState(cmd, &ds);
+
+   dkColorStateDefaults(&cs);
+   dkCmdBufBindColorState(cmd, &cs);
+
+   dkColorWriteStateDefaults(&cws);
+   dkColorWriteStateSetMask(&cws, 0, DkColorMask_RGBA);
+   dkCmdBufBindColorWriteState(cmd, &cws);
+
+   /* Opaque copy: no blend (default disables it). */
+   dkBlendStateDefaults(&bs);
+   dkCmdBufBindBlendStates(cmd, 0, &bs, 1);
+
+   /* Viewport/scissor = destination rect; the NDC quad fills it exactly. */
+   vp.x = (float)dst_rect->x; vp.y = (float)dst_rect->y;
+   vp.width = (float)dst_rect->width; vp.height = (float)dst_rect->height;
+   vp.near = 0.0f; vp.far = 1.0f;
+   dkCmdBufSetViewports(cmd, 0, &vp, 1);
+
+   sc.x = (uint32_t)dst_rect->x; sc.y = (uint32_t)dst_rect->y;
+   sc.width = dst_rect->width;   sc.height = dst_rect->height;
+   dkCmdBufSetScissors(cmd, 0, &sc, 1);
+
+   dkCmdBufDraw(cmd, DkPrimitive_TriangleStrip, 4, 1, 0, 0);
+}
+
 static bool dk3d_frame(void *data, const void *frame,
       unsigned width, unsigned height,
       uint64_t frame_count, unsigned pitch,
@@ -1318,10 +1476,74 @@ static bool dk3d_frame(void *data, const void *frame,
          dst_rect.depth  = 1;
          (void)aspect; /* aspect handled by RA's update_viewport now */
 
-         dk3d_blit_sub(dk3d, f, src, blit_src_x, blit_src_y, src_w, src_h,
-               swap_img, &dst_rect,
-               (dk3d->smooth ? DK3D_BLIT_LINEAR : 0)
-               | (dk3d->hw_bottom_left ? 0 : DK3D_BLIT_FLIP_Y));
+         if (dk3d->filter_chain
+               && dk3d_filter_chain_get_preset(dk3d->filter_chain))
+         {
+            const DkImage *chain_src;
+            DkImageRect    crop_dst;
+
+            /* Both sources are larger than the visible frame: the HW working
+             * texture holds the picture in a sub-rect at (hw_src_x, hw_src_y),
+             * and the fixed 1024x1024 sw_stage holds it at the top-left. A
+             * sampler view spans the whole image, so crop the active region
+             * [blit_src_x, blit_src_y, src_w, src_h] into a frame-sized image
+             * and feed THAT to the chain. This makes [0,1] map to the frame
+             * (not the oversized allocation) and SourceSize honest, mirroring
+             * the dk3d_blit_sub crop the non-shader path already does. */
+            if (   dk3d->chain_input.width  != src_w
+                || dk3d->chain_input.height != src_h)
+            {
+               dk3d_destroy_image(&dk3d->chain_input);
+               dk3d_create_image_2d(dk3d->device, src_w, src_h,
+                     DkImageFormat_RGBA8_Unorm,
+                     DkImageFlags_UsageRender | DkImageFlags_Usage2DEngine
+                     | DkImageFlags_HwCompression,
+                     &dk3d->chain_input);
+            }
+
+            crop_dst.x      = 0;
+            crop_dst.y      = 0;
+            crop_dst.z      = 0;
+            crop_dst.width  = src_w;
+            crop_dst.height = src_h;
+            crop_dst.depth  = 1;
+            dk3d_blit_sub(dk3d, f, src, blit_src_x, blit_src_y,
+                  src_w, src_h, &dk3d->chain_input.image, &crop_dst, 0);
+            /* Crop blit must complete before the chain samples it. */
+            dkCmdBufBarrier(f->cmdbuf, DkBarrier_Fragments,
+                  DkInvalidateFlags_Image);
+            chain_src = &dk3d->chain_input.image;
+
+            dk3d_filter_chain_set_input_texture(dk3d->filter_chain,
+                  chain_src, src_w, src_h);
+            dk3d_filter_chain_set_frame_count(dk3d->filter_chain,
+                  frame_count);
+            dk3d_filter_chain_set_viewport(dk3d->filter_chain,
+                  dst_rect.x, dst_rect.y,
+                  dst_rect.width, dst_rect.height);
+            dk3d_filter_chain_build_offscreen_passes(dk3d->filter_chain,
+                  f->cmdbuf);
+            /* Final pass now renders into the chain's own viewport-sized FBO
+             * (not the swapchain). Composite it onto the swapchain via the 3D
+             * blit, which rebinds the swapchain as RT so the menu/OSD below
+             * land on it. The final pass ended with a fragment barrier, so the
+             * FBO is safe to sample here. */
+            dk3d_filter_chain_build_viewport_pass(dk3d->filter_chain,
+                  f->cmdbuf, swap_img);
+            {
+               const DkImage *chain_out =
+                  dk3d_filter_chain_get_output(dk3d->filter_chain);
+               if (chain_out)
+                  dk3d_present_3d(dk3d, f, chain_out, &dst_rect, false);
+            }
+         }
+         else
+         {
+            dk3d_blit_sub(dk3d, f, src, blit_src_x, blit_src_y, src_w, src_h,
+                  swap_img, &dst_rect,
+                  (dk3d->smooth ? DK3D_BLIT_LINEAR : 0)
+                  | (dk3d->hw_bottom_left ? 0 : DK3D_BLIT_FLIP_Y));
+         }
       }
    }
 
@@ -2330,7 +2552,49 @@ static bool dk3d_focus(void *data)              { (void)data; return true; }
 static bool dk3d_suppress_screensaver(void *data, bool e) { (void)data; (void)e; return false; }
 static bool dk3d_has_windowed(void *data)       { (void)data; return false; }
 static bool dk3d_set_shader(void *data,
-      enum rarch_shader_type t, const char *p)  { (void)data; (void)t; (void)p; return false; }
+      enum rarch_shader_type t, const char *p)
+{
+   dk3d_t *dk3d = (dk3d_t *)data;
+   struct dk3d_filter_chain_create_info info;
+   if (!dk3d)
+      return false;
+
+   if (dk3d->filter_chain)
+   {
+      dk3d_filter_chain_free(dk3d->filter_chain);
+      dk3d->filter_chain = NULL;
+   }
+
+   if (p && *p && t != RARCH_SHADER_SLANG)
+   {
+      RARCH_WARN("[deko3d] Only slang (.slangp) shaders are supported.\n");
+      p = NULL;
+   }
+
+   info.device           = dk3d->device;
+   info.queue            = dk3d->queue;
+   info.max_input_width  = 1024;
+   info.max_input_height = 512;
+   info.swapchain_width  = dk3d->surface_width;
+   info.swapchain_height = dk3d->surface_height;
+   info.swapchain_format = DkImageFormat_RGBA8_Unorm;
+
+   if (!p || !*p)
+   {
+      dk3d->filter_chain = dk3d_filter_chain_create_default(&info, dk3d->smooth);
+      return true;
+   }
+
+   dk3d->filter_chain = dk3d_filter_chain_create_from_preset(&info, p);
+   if (!dk3d->filter_chain)
+   {
+      RARCH_ERR("[deko3d] Shader preset failed, falling back to stock.\n");
+      dk3d->filter_chain = dk3d_filter_chain_create_default(&info, dk3d->smooth);
+      return false;
+   }
+
+   return true;
+}
 static void dk3d_set_rotation(void *data, unsigned r)
 {
    dk3d_t *dk3d = (dk3d_t*)data;
@@ -2565,6 +2829,14 @@ static void dk3d_unload_texture(void *data, bool threaded, uintptr_t handle)
    free(tex);
 }
 
+static struct video_shader *dk3d_get_current_shader(void *data)
+{
+   dk3d_t *dk3d = (dk3d_t *)data;
+   if (dk3d && dk3d->filter_chain)
+      return dk3d_filter_chain_get_preset(dk3d->filter_chain);
+   return NULL;
+}
+
 static const video_poke_interface_t dk3d_poke_interface = {
    dk3d_get_flags,
    dk3d_load_texture,
@@ -2584,7 +2856,7 @@ static const video_poke_interface_t dk3d_poke_interface = {
    font_driver_render_msg,
    NULL, /* show_mouse */
    NULL, /* grab_mouse_toggle */
-   NULL, /* get_current_shader */
+   dk3d_get_current_shader,
    NULL, /* get_current_software_framebuffer */
    dk3d_get_hw_render_interface,
    NULL, NULL, NULL, NULL, NULL  /* HDR */

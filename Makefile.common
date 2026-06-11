@@ -1279,7 +1279,8 @@ ifeq ($(TARGET), retroarch_switch)
          OBJ += gfx/drivers_context/switch_ctx.o
       endif
       ifeq ($(HAVE_DEKO3D), 1)
-         OBJ      += gfx/drivers/deko3d.o
+         OBJ      += gfx/drivers/deko3d.o \
+                     gfx/drivers_shader/shader_deko3d.o
          DEFINES  += -DHAVE_DEKO3D
          INCLUDE_DIRS += -Igfx/include
          # Menu shaders for gfx_display_ctx_deko3d. GLSL -> DKSH (uam) ->

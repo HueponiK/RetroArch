@@ -31,6 +31,8 @@
 extern "C" {
 #endif
 
+typedef struct dk3d_filter_chain dk3d_filter_chain_t;
+
 /* Compile-time maxima for fixed-size arrays inside dk3d_t. Runtime
  * counts (dk3d->num_swapchain_images, dk3d->num_frames_in_flight) are
  * populated from settings at init and may be smaller than these caps. */
@@ -86,6 +88,7 @@ typedef struct dk3d_image
    uint32_t     width;
    uint32_t     height;
    DkImageFormat format;
+   uint32_t     mip_levels;  /* 1 = no mipmaps */
 } dk3d_image_t;
 
 /* Linear staging buffer pair: a CPU-visible DkMemBlock that the CPU writes
@@ -202,6 +205,13 @@ typedef struct dk3d
    unsigned           hw_src_y;
    unsigned           hw_image_full_w;
    unsigned           hw_image_full_h;
+   /* Active region of the source image cropped to its own frame-sized image
+    * so the filter chain samples the visible frame ([0,1] == frame), not the
+    * whole oversized source allocation. The source is oversized in both
+    * paths: the HW working texture (sub-rect at hw_src_x/y) and the fixed
+    * 1024x1024 sw_stage (frame uploaded to the top-left). Lazily (re)created
+    * on size change. */
+   dk3d_image_t       chain_input;
    float              hw_aspect;
    DkFence           *hw_acquire_fence;
    DkFence           *hw_release_fence;
@@ -217,12 +227,18 @@ typedef struct dk3d
    DkMemBlock   blit_shader_mem;
    DkMemBlock   blit_sampler_desc_mem;
    DkGpuAddr    blit_sampler_desc_gpu;
+
+   /* Shader filter chain (NULL = passthrough blit, no shaders). */
+   dk3d_filter_chain_t *filter_chain;
 } dk3d_t;
 
 /* Helpers (dk3d_init.c-style: implemented in deko3d.c for now). */
 bool  dk3d_create_image_2d(DkDevice device,
       uint32_t width, uint32_t height, DkImageFormat fmt,
       uint32_t flags, dk3d_image_t *out);
+bool  dk3d_create_image_2d_mips(DkDevice device,
+      uint32_t width, uint32_t height, DkImageFormat fmt,
+      uint32_t flags, uint32_t mip_levels, dk3d_image_t *out);
 void  dk3d_destroy_image(dk3d_image_t *img);
 
 bool  dk3d_stage_create(DkDevice device, uint32_t cpu_capacity,
