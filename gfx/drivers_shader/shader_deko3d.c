@@ -114,7 +114,8 @@ typedef struct dk3d_chain_pass
    struct gfx_fbo_scale scale;
    unsigned     filter;
    enum gfx_wrap_type wrap;
-   bool         mipmap;
+   bool         mipmap;          /* mipmap_input: this pass samples its input mipmapped */
+   bool         out_needs_mips;  /* a later pass samples THIS pass's output mipmapped */
    bool         float_fbo;
    unsigned     frame_count_mod;
    char         alias[64];
@@ -1199,6 +1200,54 @@ static void dk3d_compute_pass_fbo_size(
    if (*out_h < 1) *out_h = 1;
 }
 
+/* Full mip chain count for a 2D image: floor(log2(max(w,h))) + 1. */
+static unsigned dk3d_mip_level_count(unsigned w, unsigned h)
+{
+   unsigned m      = (w > h) ? w : h;
+   unsigned levels = 1;
+   while (m > 1) { m >>= 1; levels++; }
+   return levels;
+}
+
+/* Generate the mip chain of an already-rendered level 0 by linearly
+ * downsampling each level into the next with the 2D-engine blit (the same
+ * path dk3d_blit_sub uses). deko3d has no auto-mipgen; per-level views select
+ * the source/destination level. A barrier between levels makes each freshly
+ * written level visible to the next downsample. */
+static void dk3d_generate_mips(DkCmdBuf cmd, const dk3d_image_t *img)
+{
+   unsigned l;
+
+   /* Level 0 was just rendered (3D); make it visible to the 2D blit below. */
+   dkCmdBufBarrier(cmd, DkBarrier_Fragments, DkInvalidateFlags_Image);
+
+   for (l = 1; l < img->mip_levels; l++)
+   {
+      DkImageView src_view, dst_view;
+      DkImageRect src_rect, dst_rect;
+      unsigned sw = img->width  >> (l - 1); if (sw < 1) sw = 1;
+      unsigned sh = img->height >> (l - 1); if (sh < 1) sh = 1;
+      unsigned dw = img->width  >> l;       if (dw < 1) dw = 1;
+      unsigned dh = img->height >> l;       if (dh < 1) dh = 1;
+
+      dkImageViewDefaults(&src_view, &img->image);
+      src_view.mipLevelOffset = (uint8_t)(l - 1);
+      src_view.mipLevelCount  = 1;
+      dkImageViewDefaults(&dst_view, &img->image);
+      dst_view.mipLevelOffset = (uint8_t)l;
+      dst_view.mipLevelCount  = 1;
+
+      src_rect.x = src_rect.y = src_rect.z = 0;
+      src_rect.width = sw; src_rect.height = sh; src_rect.depth = 1;
+      dst_rect.x = dst_rect.y = dst_rect.z = 0;
+      dst_rect.width = dw; dst_rect.height = dh; dst_rect.depth = 1;
+
+      dkCmdBufBlitImage(cmd, &src_view, &src_rect, &dst_view, &dst_rect,
+            DkBlitFlag_FilterLinear, 0);
+      dkCmdBufBarrier(cmd, DkBarrier_Fragments, DkInvalidateFlags_Image);
+   }
+}
+
 static bool dk3d_chain_create_pass_fbo(DkDevice device, DkQueue queue,
       dk3d_chain_pass_t *pass, unsigned w, unsigned h)
 {
@@ -1221,7 +1270,18 @@ static bool dk3d_chain_create_pass_fbo(DkDevice device, DkQueue queue,
 
    if (!pass->fbo.memblock)
    {
-      if (!dk3d_create_image_2d(device, w, h, fmt, flags, &pass->fbo))
+      if (pass->out_needs_mips)
+      {
+         /* A later pass samples this output mipmapped: allocate a full mip
+          * chain. Drop HwCompression — per-level downsample blits are safer
+          * on uncompressed storage. */
+         unsigned levels = dk3d_mip_level_count(w, h);
+         uint32_t mflags = flags & ~(uint32_t)DkImageFlags_HwCompression;
+         if (!dk3d_create_image_2d_mips(device, w, h, fmt, mflags, levels,
+                  &pass->fbo))
+            return false;
+      }
+      else if (!dk3d_create_image_2d(device, w, h, fmt, flags, &pass->fbo))
          return false;
       pass->fbo_width  = w;
       pass->fbo_height = h;
@@ -1291,6 +1351,10 @@ static void dk3d_chain_rebuild_descs(dk3d_filter_chain_t *chain)
       s.minFilter = (p->filter == RARCH_FILTER_LINEAR)
                   ? DkFilter_Linear : DkFilter_Nearest;
       s.magFilter = s.minFilter;
+
+      /* mipmap_input: this pass samples its mipmapped source across LODs. */
+      if (p->mipmap)
+         s.mipFilter = DkMipFilter_Linear;
 
       switch (p->wrap)
       {
@@ -1614,6 +1678,13 @@ dk3d_filter_chain_t *dk3d_filter_chain_create_from_preset(
    }
    chain->num_luts = i;
 
+   /* A pass's output needs a mip chain iff a later pass samples it mipmapped.
+    * With the default slang binding pass i+1's Source is pass i's output, so
+    * pass i needs mips when pass i+1 requests mipmap_input. Must run before the
+    * FBO allocation below so those targets are created with mip levels. */
+   for (i = 0; i + 1 < chain->num_passes; i++)
+      chain->passes[i].out_needs_mips = chain->passes[i + 1].mipmap;
+
    /* Allocate initial FBOs for non-final passes. */
    for (i = 0; i + 1 < chain->num_passes; i++)
    {
@@ -1815,8 +1886,11 @@ static void dk3d_render_pass(dk3d_filter_chain_t *chain, DkCmdBuf cmd,
    uint32_t push_fbase   = frame_slot * (DK3D_PUSH_MAX_SIZE * DK3D_CHAIN_MAX_PASSES);
    uint32_t img_fbase    = frame_slot * (DK3D_CHAIN_MAX_PASSES * DK3D_MAX_TEX_BINDINGS);
 
-   /* Bind render target. */
+   /* Bind render target. Always target a single mip level (0): for a mipmapped
+    * FBO the default all-levels view is invalid as a render target, and the
+    * mip chain is built afterwards from this level by dk3d_generate_mips. */
    dk3d_make_view(&dst_view, dst);
+   dst_view.mipLevelCount = 1;
    {
       const DkImageView *targets[1] = { &dst_view };
       dkCmdBufBindRenderTargets(cmd, targets, 1, NULL);
@@ -2240,6 +2314,10 @@ void dk3d_filter_chain_build_offscreen_passes(dk3d_filter_chain_t *chain,
             src, src_w, src_h,
             &pass->fbo.image, fbo_w, fbo_h,
             false);
+
+      /* If a later pass samples this output mipmapped, build its mip chain. */
+      if (pass->out_needs_mips && pass->fbo.mip_levels > 1)
+         dk3d_generate_mips(cmdbuf, &pass->fbo);
 
       src   = &pass->fbo.image;
       src_w = fbo_w;

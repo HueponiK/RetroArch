@@ -61,9 +61,9 @@ static uint32_t dk3d_align_up(uint32_t v, uint32_t a)
    return (v + (a - 1)) & ~(a - 1);
 }
 
-bool dk3d_create_image_2d(DkDevice device,
+bool dk3d_create_image_2d_mips(DkDevice device,
       uint32_t width, uint32_t height, DkImageFormat fmt,
-      uint32_t flags, dk3d_image_t *out)
+      uint32_t flags, uint32_t mip_levels, dk3d_image_t *out)
 {
    DkImageLayoutMaker lm;
    DkImageLayout      layout;
@@ -80,6 +80,7 @@ bool dk3d_create_image_2d(DkDevice device,
    lm.dimensions[0] = width;
    lm.dimensions[1] = height;
    lm.dimensions[2] = 0;
+   lm.mipLevels     = mip_levels ? mip_levels : 1;
    dkImageLayoutInitialize(&layout, &lm);
 
    size  = dkImageLayoutGetSize(&layout);
@@ -98,10 +99,18 @@ bool dk3d_create_image_2d(DkDevice device,
       return false;
 
    dkImageInitialize(&out->image, &layout, out->memblock, 0);
-   out->width  = width;
-   out->height = height;
-   out->format = fmt;
+   out->width      = width;
+   out->height     = height;
+   out->format     = fmt;
+   out->mip_levels = lm.mipLevels;
    return true;
+}
+
+bool dk3d_create_image_2d(DkDevice device,
+      uint32_t width, uint32_t height, DkImageFormat fmt,
+      uint32_t flags, dk3d_image_t *out)
+{
+   return dk3d_create_image_2d_mips(device, width, height, fmt, flags, 1, out);
 }
 
 void dk3d_destroy_image(dk3d_image_t *img)

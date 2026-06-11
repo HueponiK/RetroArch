@@ -88,6 +88,7 @@ typedef struct dk3d_image
    uint32_t     width;
    uint32_t     height;
    DkImageFormat format;
+   uint32_t     mip_levels;  /* 1 = no mipmaps */
 } dk3d_image_t;
 
 /* Linear staging buffer pair: a CPU-visible DkMemBlock that the CPU writes
@@ -235,6 +236,9 @@ typedef struct dk3d
 bool  dk3d_create_image_2d(DkDevice device,
       uint32_t width, uint32_t height, DkImageFormat fmt,
       uint32_t flags, dk3d_image_t *out);
+bool  dk3d_create_image_2d_mips(DkDevice device,
+      uint32_t width, uint32_t height, DkImageFormat fmt,
+      uint32_t flags, uint32_t mip_levels, dk3d_image_t *out);
 void  dk3d_destroy_image(dk3d_image_t *img);
 
 bool  dk3d_stage_create(DkDevice device, uint32_t cpu_capacity,
