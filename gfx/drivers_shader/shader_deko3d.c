@@ -56,6 +56,7 @@ enum dk3d_semantic
    DK3D_SEM_ORIGINAL_SIZE,
    DK3D_SEM_FRAME_COUNT,
    DK3D_SEM_FRAME_DIRECTION,
+   DK3D_SEM_FINAL_VIEWPORT_SIZE,
    DK3D_SEM_PASS_SIZE,
    DK3D_SEM_LUT_SIZE
 };
@@ -348,6 +349,7 @@ static enum dk3d_semantic dk3d_name_to_semantic(const char *name)
    if (string_is_equal(name, "OriginalSize"))   return DK3D_SEM_ORIGINAL_SIZE;
    if (string_is_equal(name, "FrameCount"))     return DK3D_SEM_FRAME_COUNT;
    if (string_is_equal(name, "FrameDirection")) return DK3D_SEM_FRAME_DIRECTION;
+   if (string_is_equal(name, "FinalViewportSize")) return DK3D_SEM_FINAL_VIEWPORT_SIZE;
    return DK3D_SEM_PARAM;
 }
 
@@ -1838,6 +1840,12 @@ static void dk3d_render_pass(dk3d_filter_chain_t *chain, DkCmdBuf cmd,
                                1.0f / dst_w, 1.0f / dst_h};
                  memcpy(buf + s->offset, v, 16); }
                break;
+            case DK3D_SEM_FINAL_VIEWPORT_SIZE:
+               { float vw = (float)(chain->vp_width  ? chain->vp_width  : dst_w);
+                 float vh = (float)(chain->vp_height ? chain->vp_height : dst_h);
+                 float v[4] = { vw, vh, 1.0f / vw, 1.0f / vh };
+                 memcpy(buf + s->offset, v, 16); }
+               break;
             case DK3D_SEM_SOURCE_SIZE:
                { float v[4] = {(float)src_w, (float)src_h,
                                1.0f / src_w, 1.0f / src_h};
@@ -1906,6 +1914,12 @@ static void dk3d_render_pass(dk3d_filter_chain_t *chain, DkCmdBuf cmd,
             case DK3D_SEM_OUTPUT_SIZE:
                { float v[4] = {(float)dst_w, (float)dst_h,
                                1.0f / dst_w, 1.0f / dst_h};
+                 memcpy(buf + s->offset, v, 16); }
+               break;
+            case DK3D_SEM_FINAL_VIEWPORT_SIZE:
+               { float vw = (float)(chain->vp_width  ? chain->vp_width  : dst_w);
+                 float vh = (float)(chain->vp_height ? chain->vp_height : dst_h);
+                 float v[4] = { vw, vh, 1.0f / vw, 1.0f / vh };
                  memcpy(buf + s->offset, v, 16); }
                break;
             case DK3D_SEM_SOURCE_SIZE:
