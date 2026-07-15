@@ -953,6 +953,18 @@ static void dk3d_free(void *data)
    if (dk3d->swapchain) { dkSwapchainDestroy(dk3d->swapchain); dk3d->swapchain = NULL; }
    for (i = 0; i < dk3d->num_swapchain_images; i++)
       dk3d_destroy_image(&dk3d->sc_images[i]);
+
+   /* deko3d's swapchain (dkSwapchainCreate) sets HAL_TRANSFORM_FLIP_V on the
+    * shared default NWindow to compensate for its OriginLowerLeft origin, and
+    * never clears it. Whatever video driver takes this same NWindow over next
+    * inherits the flip, most visibly the GL/EGL menu driver RetroArch falls
+    * back to when the deko3d HW core unloads on "Close Content", which then
+    * presents the whole menu upside-down. Restore the libnx default (0 = no
+    * transform) so the next driver starts from the same clean window state it
+    * had at boot. */
+   if (dk3d->win)
+      nwindowSetTransform(dk3d->win, 0);
+
    if (dk3d->queue)  { dkQueueDestroy(dk3d->queue);   dk3d->queue  = NULL; }
    if (dk3d->device) { dkDeviceDestroy(dk3d->device); dk3d->device = NULL; }
    free(dk3d);
