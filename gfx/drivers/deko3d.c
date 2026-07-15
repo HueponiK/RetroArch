@@ -953,6 +953,18 @@ static void dk3d_free(void *data)
    if (dk3d->swapchain) { dkSwapchainDestroy(dk3d->swapchain); dk3d->swapchain = NULL; }
    for (i = 0; i < dk3d->num_swapchain_images; i++)
       dk3d_destroy_image(&dk3d->sc_images[i]);
+
+   /* deko3d's swapchain (dkSwapchainCreate) sets HAL_TRANSFORM_FLIP_V on the
+    * shared default NWindow to compensate for its OriginLowerLeft origin, and
+    * never clears it. Whatever video driver takes this same NWindow over next
+    * inherits the flip, most visibly the GL/EGL menu driver RetroArch falls
+    * back to when the deko3d HW core unloads on "Close Content", which then
+    * presents the whole menu upside-down. Restore the libnx default (0 = no
+    * transform) so the next driver starts from the same clean window state it
+    * had at boot. */
+   if (dk3d->win)
+      nwindowSetTransform(dk3d->win, 0);
+
    if (dk3d->queue)  { dkQueueDestroy(dk3d->queue);   dk3d->queue  = NULL; }
    if (dk3d->device) { dkDeviceDestroy(dk3d->device); dk3d->device = NULL; }
    free(dk3d);
@@ -1251,7 +1263,20 @@ static bool dk3d_frame(void *data, const void *frame,
    dk3d_make_image_view(&sc_view, swap_img);
    {
       const DkImageView *targets[1] = { &sc_view };
+      /* deko3d clears are bounded by the active scissor, and the scissor is
+       * sticky GPU state: the previous frame's last menu/font/OSD draw leaves
+       * a sub-rect scissor on the queue. Without resetting it here the clear
+       * only covers that sub-rect, so the letterbox bars (and any area the
+       * content blit doesn't touch) keep last frame's stale menu pixels,
+       * visible as menu residue after closing/leaving the RetroArch menu.
+       * Reset viewport + scissor to the full surface first; the content blit
+       * (2D engine) ignores them and every menu/font draw sets its own, so
+       * this only governs the clear. */
+      DkViewport full_vp = { 0.0f, 0.0f, (float)sw, (float)sh, 0.0f, 1.0f };
+      DkScissor  full_sc = { 0, 0, sw, sh };
       dkCmdBufBindRenderTargets(f->cmdbuf, targets, 1, NULL);
+      dkCmdBufSetViewports(f->cmdbuf, 0, &full_vp, 1);
+      dkCmdBufSetScissors(f->cmdbuf, 0, &full_sc, 1);
       dkCmdBufClearColor(f->cmdbuf, 0,
             DkColorMask_RGBA, clear_color);
    }
