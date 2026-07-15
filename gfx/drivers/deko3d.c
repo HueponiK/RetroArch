@@ -1251,7 +1251,20 @@ static bool dk3d_frame(void *data, const void *frame,
    dk3d_make_image_view(&sc_view, swap_img);
    {
       const DkImageView *targets[1] = { &sc_view };
+      /* deko3d clears are bounded by the active scissor, and the scissor is
+       * sticky GPU state: the previous frame's last menu/font/OSD draw leaves
+       * a sub-rect scissor on the queue. Without resetting it here the clear
+       * only covers that sub-rect, so the letterbox bars (and any area the
+       * content blit doesn't touch) keep last frame's stale menu pixels,
+       * visible as menu residue after closing/leaving the RetroArch menu.
+       * Reset viewport + scissor to the full surface first; the content blit
+       * (2D engine) ignores them and every menu/font draw sets its own, so
+       * this only governs the clear. */
+      DkViewport full_vp = { 0.0f, 0.0f, (float)sw, (float)sh, 0.0f, 1.0f };
+      DkScissor  full_sc = { 0, 0, sw, sh };
       dkCmdBufBindRenderTargets(f->cmdbuf, targets, 1, NULL);
+      dkCmdBufSetViewports(f->cmdbuf, 0, &full_vp, 1);
+      dkCmdBufSetScissors(f->cmdbuf, 0, &full_sc, 1);
       dkCmdBufClearColor(f->cmdbuf, 0,
             DkColorMask_RGBA, clear_color);
    }
